@@ -1,0 +1,11 @@
+tqdm==4.48.2
+PyMuPDF==1.18.1
+requests==2.24.0
+doclayout_yolo==0.0.4
+docling==2.76.0
+fitz==0.0.1.dev2
+marker==2.1.5
+Pillow==12.1.1
+pyzotero==1.10.0
+torch==2.10.0
+transformers==5.2.0
