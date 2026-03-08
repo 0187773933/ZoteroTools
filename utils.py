@@ -1,32 +1,19 @@
-#!/usr/bin/env python3
-import sqlite3
+import os
+import re
 import json
-import shutil
 import tempfile
+import shutil
 from pathlib import Path
+import sqlite3
+import base64
 
-HOME = Path.home()
-ZOTERO_DB = HOME / "Zotero" / "zotero.sqlite"
-ZOTERO_STORAGE = HOME / "Zotero" / "storage"
+def write_json( file_path , python_object ):
+	with open( file_path , 'w', encoding='utf-8' ) as f:
+		json.dump( python_object , f , ensure_ascii=False , indent=4 )
 
-MAIN_DIR = HOME / ".zotero-cg"
-META_DATA_DIR = MAIN_DIR / "meta-data"
-META_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def write_json(file_path, python_object):
-	with open(file_path, "w", encoding="utf-8") as f:
-		json.dump(python_object, f, ensure_ascii=False, indent=4)
-
-
-def zotero_open_snapshot():
-	tmpdir = Path(tempfile.mkdtemp(prefix="zotero_db_"))
-	tmpdb = tmpdir / "zotero.sqlite"
-	shutil.copy2(ZOTERO_DB, tmpdb)
-	conn = sqlite3.connect(tmpdb)
-	conn.row_factory = sqlite3.Row
-	return conn
-
+def read_json( file_path ):
+	with open( file_path ) as f:
+		return json.load( f )
 
 def normalize_doi(value: str) -> str:
 	if not value:
@@ -36,7 +23,109 @@ def normalize_doi(value: str) -> str:
 	return v.strip()
 
 
-def zotero_collect_meta_data():
+def base64_encode( message ):
+	try:
+		message_bytes = message.encode( 'utf-8' )
+		base64_bytes = base64.b64encode( message_bytes )
+		base64_message = base64_bytes.decode( 'utf-8' )
+		return base64_message
+	except Exception as e:
+		print( e )
+		return False
+
+def base64_decode( base64_message ):
+	try:
+		base64_bytes = base64_message.encode( 'utf-8' )
+		message_bytes = base64.b64decode(base64_bytes)
+		message = message_bytes.decode( 'utf-8' )
+		return message
+	except Exception as e:
+		print( e )
+		return False
+
+def doi_fp( doi ):
+	return re.sub( r'[^a-zA-Z0-9._-]', '_' , doi )
+
+def _candidates_common(home):
+	return [
+		home / "Zotero" / "zotero.sqlite",
+		home / "ZoteroBeta" / "zotero.sqlite",
+		home / "Zotero Beta" / "zotero.sqlite",
+		home / "Library" / "Application Support" / "Zotero" / "zotero.sqlite",
+		home / "Library" / "Application Support" / "ZoteroBeta" / "zotero.sqlite",
+		home / "Library" / "Application Support" / "Zotero Beta" / "zotero.sqlite",
+	]
+
+def _bounded_find_sqlite(home):
+	roots = [
+		home / "Zotero",
+		home / "Library" / "Application Support" / "Zotero",
+		home / "Library" / "Application Support",
+	]
+	roots = [r for r in roots if r.exists()]
+
+	best: Optional[Tuple[float, Path]] = None  # (mtime, path)
+
+	for root in roots:
+		for pat in ("zotero.sqlite", "**/zotero.sqlite"):
+			try:
+				for p in root.glob(pat):
+					if p.name != "zotero.sqlite":
+						continue
+					try:
+						st = p.stat()
+					except OSError:
+						continue
+					if best is None or st.st_mtime > best[0]:
+						best = (st.st_mtime, p)
+			except Exception:
+				continue
+
+	return best[1] if best else None
+
+def resolve_zotero_db_path(cli_db ):
+	# 1) CLI
+	if cli_db:
+		p = Path(cli_db).expanduser()
+		if p.exists():
+			return p
+		raise SystemExit(f"--db path does not exist: {p}")
+
+	# 2) ENV
+	env = os.environ.get("ZOTERO_DB", "").strip()
+	if env:
+		p = Path(env).expanduser()
+		if p.exists():
+			return p
+		raise SystemExit(f"ZOTERO_DB path does not exist: {p}")
+
+	home = Path.home()
+
+	# 3) Common locations
+	for p in _candidates_common(home):
+		if p.exists():
+			return p
+
+	# 4) Bounded search
+	p = _bounded_find_sqlite(home)
+	if p and p.exists():
+		return p
+
+	raise SystemExit(
+		"Could not find zotero.sqlite automatically.\n"
+		"Provide --db /path/to/zotero.sqlite or set ZOTERO_DB=/path/to/zotero.sqlite"
+	)
+
+ZOTERO_DB = resolve_zotero_db_path( None )
+def zotero_open_snapshot():
+	tmpdir = Path(tempfile.mkdtemp( prefix="zotero_db_" ) )
+	tmpdb = tmpdir / "zotero.sqlite"
+	shutil.copy2( ZOTERO_DB , tmpdb )
+	conn = sqlite3.connect( tmpdb )
+	conn.row_factory = sqlite3.Row
+	return conn
+
+def zotero_take_snapshot():
 	conn = zotero_open_snapshot()
 	c = conn.cursor()
 
@@ -68,9 +157,6 @@ def zotero_collect_meta_data():
 			"tags": [],
 			"collections": []
 		}
-
-	# If you want a sanity check that matches your expectation:
-	# print(f"Base bibliographic items: {len(papers)}")
 
 	# --------------------------------------------------
 	# 2) METADATA (title, DOI, journal, year, etc)
@@ -119,36 +205,6 @@ def zotero_collect_meta_data():
 	# --------------------------------------------------
 	# 4) ALL ATTACHMENTS (child items) grouped onto their parent bib item
 	# --------------------------------------------------
-	# for row in c.execute("""
-	# 	SELECT itemAttachments.parentItemID AS parentID,
-	# 		   itemAttachments.itemID       AS attachItemID,
-	# 		   items.key                    AS attachKey,
-	# 		   itemAttachments.path         AS path,
-	# 		   itemAttachments.contentType  AS contentType,
-	# 		   itemAttachments.linkMode     AS linkMode
-	# 	FROM itemAttachments
-	# 	JOIN items ON items.itemID = itemAttachments.itemID
-	# """):
-	# 	parentID = row["parentID"]
-	# 	if parentID not in papers:
-	# 		continue
-
-	# 	path = row["path"]
-	# 	attachKey = row["attachKey"]
-
-	# 	file_path = None
-	# 	if path and path.startswith("storage:"):
-	# 		candidate = ZOTERO_STORAGE / attachKey / path.replace("storage:", "")
-	# 		if candidate.exists():
-	# 			file_path = candidate
-
-	# 	papers[parentID]["attachments"].append({
-	# 		"key": attachKey,
-	# 		"contentType": row["contentType"],
-	# 		"linkMode": row["linkMode"],   # 1=imported file, 2=linked file, 3=URL
-	# 		"path": str(file_path) if file_path else None,
-	# 		"rawPath": path
-	# 	})
 	for row in c.execute("""
 		SELECT itemAttachments.parentItemID AS parentID,
 			   itemAttachments.itemID       AS attachItemID,
@@ -179,21 +235,21 @@ def zotero_collect_meta_data():
 		path = row["path"]
 		attachKey = row["attachKey"]
 
-		file_path = None
+		# file_path = None
 
-		if path and path.startswith("storage:"):
-			candidate = ZOTERO_STORAGE / attachKey / path.replace("storage:", "")
-			if candidate.exists():
-				file_path = candidate
+		# if path and path.startswith("storage:"):
+		# 	candidate = ZOTERO_STORAGE / attachKey / path.replace("storage:", "")
+		# 	if candidate.exists():
+		# 		file_path = candidate
 
 		papers[parentID]["attachments"].append({
 			"key": attachKey,
 			"contentType": row["contentType"],
 			"linkMode": row["linkMode"],  # 1=imported file, 2=linked file, 3=URL
-			"path": str(file_path) if file_path else None,
-			"rawPath": path
+			# "path": str(file_path) if file_path else None,
+			# "rawPath": path
+			"path": path
 		})
-
 
 	# --------------------------------------------------
 	# 5) TAGS (only for base bib items)
@@ -230,17 +286,3 @@ def zotero_collect_meta_data():
 
 	# Return keyed by Zotero key (one per bib item)
 	return {item["key"]: item for item in papers.values()}
-
-
-def main():
-	zmd = zotero_collect_meta_data()
-
-	for key, item in zmd.items():
-		out_file = META_DATA_DIR / f"{key}.json"
-		write_json(out_file, item)
-
-	print(f"Extracted metadata for {len(zmd)} bibliographic Zotero items")
-
-
-if __name__ == "__main__":
-	main()
