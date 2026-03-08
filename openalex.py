@@ -105,17 +105,19 @@ class OpenAlex:
 					reference_data = self.api_get_id( item )
 					if reference_data is None:
 						utils.write_json( _referenced_cached_fp , {} )
-						continue
+						continues
 					utils.write_json( _referenced_cached_fp , reference_data )
-					_r_doi = reference_data.get( "doi" )
-					if not isinstance( _r_doi , str ) or not _r_doi:
-						continue
-					_r_doi = utils.normalize_doi( _r_doi )
-					_r_doi_b64 = utils.base64_encode( _r_doi )
-					_r_cached_fp = self.storage_dir.joinpath( f"{_r_doi_b64}.json" )
+
+					## Symlinks for references by DOI (if available) - this is optional and can be skipped to save space
+					# _r_doi = reference_data.get( "doi" )
+					# if not isinstance( _r_doi , str ) or not _r_doi:
+					# 	continue
+					# _r_doi = utils.normalize_doi( _r_doi )
+					# _r_doi_b64 = utils.base64_encode( _r_doi )
+					# _r_cached_fp = self.storage_dir.joinpath( f"{_r_doi_b64}.json" )
 					# utils.write_json( _r_cached_fp , reference_data )
-					if not _r_cached_fp.exists():
-						_r_cached_fp.symlink_to( _referenced_cached_fp )
+					# if not _r_cached_fp.exists():
+					# 	_r_cached_fp.symlink_to( _referenced_cached_fp )
 
 	def doi( self , doi ):
 		_doi = utils.doi_fp( doi )
