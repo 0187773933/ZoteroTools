@@ -105,7 +105,7 @@ class OpenAlex:
 					reference_data = self.api_get_id( item )
 					if reference_data is None:
 						utils.write_json( _referenced_cached_fp , {} )
-						continues
+						continue
 					utils.write_json( _referenced_cached_fp , reference_data )
 
 					## Symlinks for references by DOI (if available) - this is optional and can be skipped to save space
