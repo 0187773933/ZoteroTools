@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import csv
 import tempfile
 import shutil
 from pathlib import Path
@@ -22,6 +23,13 @@ def normalize_doi(value: str) -> str:
 	v = v.replace("https://doi.org/", "").replace("http://doi.org/", "")
 	return v.strip()
 
+def write_csv( csv_path , headers , rows ):
+	with open( csv_path , "w" , newline="" ) as f:
+		writer = csv.DictWriter(
+			f , fieldnames=headers )
+		writer.writeheader()
+		for row in rows:
+			writer.writerow( row )
 
 def base64_encode( message ):
 	try:
