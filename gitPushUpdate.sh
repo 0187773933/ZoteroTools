@@ -1,18 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
-is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
-ssh-add -D >/dev/null 2>&1
-ssh-add -k /Users/morpheous/.ssh/githubWinStitch >/dev/null 2>&1
+BRANCH="master"
+REMOTE_NAME="origin"
+REMOTE_URL="git@github-0187773933:0187773933/ZoteroTools.git"
+SSH_KEY="/Users/morpheous/.ssh/githubWinStitch"
+
+# Make sure this exact key is loaded
+ssh-add -D >/dev/null 2>&1 || true
+ssh-add -k "$SSH_KEY" >/dev/null 2>&1
 
 [ -d .git ] || git init
 
 git config user.name  "0187773933"
 git config user.email "collincerbus@student.olympic.edu"
 
-if ! git remote | grep -qx "origin"; then
-	git remote add origin git@github.com:0187773933/ZoteroTools.git
+# Force origin to use the SSH config alias, not github.com
+if git remote | grep -qx "$REMOTE_NAME"; then
+	git remote set-url "$REMOTE_NAME" "$REMOTE_URL"
+else
+	git remote add "$REMOTE_NAME" "$REMOTE_URL"
+fi
+
+# Make sure current branch is master
+CURRENT_BRANCH="$(git branch --show-current 2>/dev/null || true)"
+if [ -z "$CURRENT_BRANCH" ]; then
+	git checkout -B "$BRANCH"
+elif [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
+	git branch -M "$BRANCH"
 fi
 
 # skip if no changes
@@ -21,7 +38,8 @@ if [ -z "$(git status --porcelain)" ]; then
 	exit 0
 fi
 
-LastCommit=$(git log -1 --pretty="%B" 2>/dev/null | xargs || echo "0")
+LastCommit="$(git log -1 --pretty="%B" 2>/dev/null | xargs || echo "0")"
+
 if is_int "$LastCommit"; then
 	NextCommitNumber=$((LastCommit + 1))
 else
@@ -41,16 +59,22 @@ fi
 
 git commit -m "$CommitMsg"
 
-# safely replace tag
+# safely replace local tag
 if git tag | grep -qx "$Tag"; then
 	git tag -d "$Tag" >/dev/null 2>&1
 fi
-if git ls-remote --tags origin | grep -q "refs/tags/$Tag$"; then
-	git push --delete origin "$Tag" >/dev/null 2>&1 || true
+
+# safely replace remote tag
+if git ls-remote --tags "$REMOTE_NAME" | grep -q "refs/tags/$Tag$"; then
+	git push --delete "$REMOTE_NAME" "$Tag" >/dev/null 2>&1 || true
 fi
 
 git tag "$Tag"
 
-# Push only current branch and current tag (not all tags)
-git push origin master
-git push origin "$Tag"
+# Verify GitHub sees the right identity
+echo "Testing SSH identity..."
+ssh -T github-0187773933 || true
+
+# Push only current branch and current tag
+git push "$REMOTE_NAME" "$BRANCH"
+git push "$REMOTE_NAME" "$Tag"
