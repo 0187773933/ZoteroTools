@@ -13,10 +13,7 @@ from openpyxl.styles import Font
 API_KEY = "bdDEtP2Jp4MhNyiG42Ckzv"
 BASE_URL = "https://api.openalex.org/works/"
 HEADERS = { "User-Agent": "zotero-citation-analyzer/1.0" }
-HOME = Path.home()
-MAIN_DIR = HOME / ".zotero-cg"
-META_DATA_DIR = MAIN_DIR / "meta-data"
-
+STORAGE_DIR = Path.home().joinpath( ".zotero-cg" , "openalex" )
 MAX_RETRIES = 10
 
 class OpenAlex:
@@ -26,14 +23,11 @@ class OpenAlex:
 		self.base_url = options.get( "base_url" , BASE_URL )
 		self.headers = options.get( "headers" , HEADERS )
 		self.params = { "api_key": self.api_key }
-		self.meta_data_dir = options.get( "meta_data_dir" , META_DATA_DIR )
-		self.storage_dir = self.meta_data_dir.joinpath( "openalex" )
+		self.storage_dir = options.get( "storage_dir" , STORAGE_DIR )
 		self.storage_dir.mkdir( parents=True , exist_ok=True )
 		self.references_dir = self.storage_dir.joinpath( "references" )
 		self.references_dir.mkdir( parents=True , exist_ok=True )
-		self.citation_counter = Counter()
-		self.reference_counter = Counter()
-		self.external_counter = Counter()
+		self.problem_dois = set()
 
 	def get_zotero_id( self , zotero_item ):
 		_save_path = self.storage_dir.joinpath( f"{zotero_item['key']}.json" )
@@ -53,9 +47,28 @@ class OpenAlex:
 			else:
 				return None
 
-	def api_get_id( self , open_alex_id ):
-		wid = open_alex_id.split( "/" )[ -1 ]
-		url = BASE_URL + wid
+	def api_search_title( self , title , per_page=10 ):
+		url = self.base_url.rstrip( "/" )
+		params = dict( self.params )
+		params.update({
+			"search": f'"{title}"',
+			"per-page": per_page,
+			"select": "id,doi,title,display_name,publication_year,cited_by_count,relevance_score,authorships"
+		})
+		while True:
+			r = requests.get( url , params=params , headers=self.headers )
+			if r.status_code == 200:
+				return r.json().get( "results" , [] )
+			elif r.status_code == 429:
+				retry = int( r.headers.get( "Retry-After" , 5 ) )
+				print( f"\nRate limited. Sleeping {retry}s" )
+				time.sleep( retry )
+			else:
+				print( f"\nOpenAlex title search failed: {r.status_code} {r.url} {r.text[:500]}" )
+				return []
+
+	def api_get_id( self , open_alex_wid ):
+		url = BASE_URL + open_alex_wid
 		for attempt in range( MAX_RETRIES ):
 			try:
 				r = requests.get(
@@ -71,9 +84,7 @@ class OpenAlex:
 					print(f"\nRate limited resolving refs. Sleeping {retry}s")
 					time.sleep(retry)
 					continue
-
 				else:
-					# print(f"Error fetching {wid}: HTTP {r.status_code}")
 					return None
 			except requests.exceptions.RequestException as e:
 				wait = min(2 ** attempt, 60)
@@ -83,172 +94,119 @@ class OpenAlex:
 		return None
 
 	def update_cache( self ):
-		snapshot = utils.zotero_take_snapshot()
-		for key in tqdm( snapshot , desc="Zotero-DB" , position=0 ):
-			if "doi" not in snapshot[ key ]:
-				continue
-			if snapshot[ key ][ "doi" ] is None:
-				continue
-			_doi = utils.normalize_doi( snapshot[ key ][ "doi" ] )
-			_doi_b64 = utils.base64_encode( _doi )
-			_cache_fp = self.storage_dir.joinpath( f"{_doi_b64}.json" )
-			if _cache_fp.exists():
-				data = utils.read_json( _cache_fp )
-			else:
-				data = self.api_get_doi( snapshot[ key ][ "doi" ] )
-				if data is None:
-					data = {}
-					utils.write_json( _cache_fp , data )
+		self.zotero_snapshot = utils.zotero_simple_snapshot()
+		self.zotero_snapshot_keys = self.zotero_snapshot.keys()
+		for k , key in enumerate( tqdm( self.zotero_snapshot_keys , desc="Papers" , position=0 ) ):
+
+			# 1.) Download Info for Papers in Zotero Library
+			paper_doi = self.zotero_snapshot[ key ].get( "doi" )
+			paper_title = self.zotero_snapshot[ key ].get( "title" )
+			paper_title_normalized = utils.openalex_normalize_title( paper_title )
+			z_id = self.zotero_snapshot[ key ].get( "id" )
+			zotero_cached_fp = self.storage_dir.joinpath( f"{z_id}.json" )
+			if not paper_doi:
+				if zotero_cached_fp.exists():
+					# info = utils.read_json( zotero_cached_fp )
+					# paper_doi = info.get( "doi" )
+					# paper_title = info.get( "title" )
 					continue
-				utils.write_json( _cache_fp , data )
-			if not data:
+				else:
+					print( "searching title" , paper_title_normalized )
+					search_results = self.api_search_title( paper_title_normalized )
+					if len( search_results ) > 1:
+						# Todo , fix to find one that has a doi ?? or idk
+						paper_dois = [ p.get( "doi" ) for p in search_results if p.get( "doi" ) is not None ]
+						if len( paper_dois ) > 1:
+							paper_doi = paper_dois[ 0 ]
+						else:
+							print( "still nothing" , self.zotero_snapshot[ key ] , search_results )
+					utils.write_json( zotero_cached_fp , { "id": z_id , "doi": paper_doi , "title": paper_title } )
+			if not paper_doi:
+				# print( "still nothing" , self.zotero_snapshot[ key ] )
 				continue
-			_wid = data.get( "id" ).split( "/" )[ -1 ]
-			self.citation_counter[ _wid ] += 1
-			if  "referenced_works" in data:
-				for i , item in enumerate( tqdm( data[ "referenced_works" ] , desc="\tReferences" , position=1 , leave=False ) ):
-					wid = item.split( "/" )[ -1 ]
-					self.reference_counter[ wid ] += 1
-					_referenced_cached_fp = self.references_dir.joinpath( f"{wid}.json" )
-					if _referenced_cached_fp.exists():
-						continue
-					reference_data = self.api_get_id( item )
-					if reference_data is None:
-						utils.write_json( _referenced_cached_fp , {} )
-						continue
-					utils.write_json( _referenced_cached_fp , reference_data )
+			paper_doi_normalized = utils.normalize_doi( paper_doi )
+			paper_doi_b64 = utils.base64_encode( paper_doi_normalized )
+			paper_cached_fp = self.storage_dir.joinpath( f"{paper_doi_b64}.json" )
+			if paper_cached_fp.exists() == True:
+				continue
+			paper_data = self.api_get_doi( paper_doi )
+			utils.write_json( paper_cached_fp , paper_data )
 
-					## Symlinks for references by DOI (if available) - this is optional and can be skipped to save space
-					# _r_doi = reference_data.get( "doi" )
-					# if not isinstance( _r_doi , str ) or not _r_doi:
-					# 	continue
-					# _r_doi = utils.normalize_doi( _r_doi )
-					# _r_doi_b64 = utils.base64_encode( _r_doi )
-					# _r_cached_fp = self.storage_dir.joinpath( f"{_r_doi_b64}.json" )
-					# utils.write_json( _r_cached_fp , reference_data )
-					# if not _r_cached_fp.exists():
-					# 	_r_cached_fp.symlink_to( _referenced_cached_fp )
-
-
-
-		citations_fp = self.storage_dir.joinpath( "citations_frequency.xlsx" )
-		references_fp = self.storage_dir.joinpath( "reference_frequency.xlsx" )
-		for wid , count in self.reference_counter.items():
-			if wid not in self.citation_counter:
-				self.external_counter[wid] = count
-		external_fp = self.storage_dir.joinpath( "external_frequency.xlsx" )
-
-		self.write_frequency_stats( self.citation_counter , citations_fp )
-		self.write_frequency_stats( self.reference_counter , references_fp )
-		self.write_frequency_stats( self.external_counter , external_fp )
-
-	def doi( self , doi ):
-		_doi = utils.doi_fp( doi )
-		_cache_fp = self.storage_dir.joinpath( f"{_doi}.json" )
-		if _cache_fp.exists():
-			return utils.read_json( _cache_fp )
-		data = self.api_get_doi( doi )
-		utils.write_json( _cache_fp , data )
-		return data
+			# For Each one that resolves to a doi
+			# Todo , there is still potentially references in the books , etc
+			# 2.) Download all of its References
+			referenced_works = paper_data.get( "referenced_works" )
+			if not referenced_works:
+				continue
+			for i , item in enumerate( tqdm( referenced_works , desc="References" , position=1 , leave=False ) ):
+				wid = item.split( "/" )[ -1 ]
+				reference_cached_fp = self.references_dir.joinpath( f"{wid}.json" )
+				if reference_cached_fp.exists() == True:
+					continue
+				reference_data = self.api_get_id( wid )
+				if not reference_data:
+					reference_data = {}
+				utils.write_json( reference_cached_fp , reference_data )
 
 	def stats( self ):
-		cache_files = list( self.storage_dir.glob( "*.json" ) )
-		return {
-			"total_cached_dois": len( cache_files ),
-		}
+		# 1. OpenAlex data we have for library papers
+		zp = {}
+		for fp in tqdm( list( self.storage_dir.glob( "*.json" ) ) , desc="Loading library" ):
+			d = utils.read_json( fp ) or {}
+			oid = d.get( "id" , "" )
+			if isinstance( oid , str ) and oid.startswith( "https://openalex.org/" ):
+				zp[ oid.rsplit( "/" , 1 )[ -1 ] ] = d
 
-	def write_frequency_stats(self, counter, xlsx_path):
+		# 2. Source of truth: Zotero snapshot
+		snap = utils.zotero_simple_snapshot()
+		lib_dois = { utils.normalize_doi( i[ "doi" ] ) for i in snap.values() if i.get( "doi" ) }
+		lib_titles = { utils.openalex_normalize_title( i[ "title" ] ) for i in snap.values() if i.get( "title" ) }
+		lib_wids = set( zp.keys() )
 
-		rows = []
+		# 3. Tally refs (skip wid hits early)
+		counts , citers = Counter() , {}
+		for wid , p in tqdm( zp.items() , desc="Tallying refs" ):
+			for r in p.get( "referenced_works" ) or []:
+				rw = r.rsplit( "/" , 1 )[ -1 ]
+				if rw in lib_wids:
+					continue
+				counts[ rw ] += 1
+				citers.setdefault( rw , set() ).add( wid )
 
-		for wid, count in counter.most_common():
-
-			if count < 2:
-				break
-
-			ref_fp = self.references_dir.joinpath(f"{wid}.json")
-
-			if not ref_fp.exists():
+		# 4. Build rows, second-pass dedup via DOI/title
+		title_of = lambda d: d.get( "title" ) or d.get( "display_name" ) or ""
+		rows , skipped = [] , 0
+		for rw , n in tqdm( counts.most_common() , desc="Building rows" ):
+			fp = self.references_dir / f"{rw}.json"
+			m = ( utils.read_json( fp ) or {} ) if fp.exists() else {}
+			rd = m.get( "doi" )
+			rt = m.get( "title" ) or m.get( "display_name" )
+			if rd and utils.normalize_doi( rd ) in lib_dois:
+				skipped += 1
 				continue
-
-			ref = utils.read_json(ref_fp)
-
-			if not ref:
+			if rt and utils.openalex_normalize_title( rt ) in lib_titles:
+				skipped += 1
 				continue
+			clean_doi = utils.normalize_doi( rd ) if rd else None
+			proxy_url = f"https://doi-org.ezproxy.libraries.wright.edu/{clean_doi}" if clean_doi else None
+			doi_url   = f"https://doi.org/{clean_doi}" if clean_doi else None
+			proxy = utils.Link( proxy_url , proxy_url ) if proxy_url else ""
+			link  = utils.Link( doi_url , doi_url ) if doi_url else ""
+			cited_by = " | ".join( title_of( zp[ w ] )[ :80 ] for w in sorted( citers[ rw ] ) )
+			rows.append([ n , title_of( m ) or "(no metadata)" , m.get( "publication_year" ) , proxy , clean_doi , link , m.get( "cited_by_count" ) , rw , cited_by ])
 
-			title = ref.get("title")
+		top_cited  = rows[ :1000 ]
+		top_recent = sorted( rows , key=lambda r: r[ 2 ] or 0 , reverse=True )[ :1000 ]
 
-			doi = ref.get("doi")
-			if not doi:
-				continue
-
-			_wsu_doi = utils.normalize_doi(doi)
-			_wsu_proxy = f"https://doi-org.ezproxy.libraries.wright.edu/{_wsu_doi}"
-
-			pub_date = ref.get("publication_date")
-
-			source = (
-				ref
-				.get("primary_location", {})
-				.get("source", {})
-			)
-
-			if not isinstance(source, dict):
-				continue
-
-			journal = source.get("display_name")
-			publisher = source.get("host_organization_name")
-
-			rows.append({
-				"count": count,
-				# "wid": wid,
-				"title": title,
-				"proxy": _wsu_proxy,
-				"doi": doi,
-				"publication_date": pub_date,
-				"journal": journal,
-				"publisher": publisher
-			})
-
-		headers = [
-			"count",
-			# "wid",
-			"title",
-			"proxy",
-			"doi",
-			"publication_date",
-			"journal",
-			"publisher"
-		]
-
-		wb = Workbook()
-		ws = wb.active
-		ws.title = "frequency"
-
-		# header row
-		ws.append(headers)
-
-		for row in rows:
-
-			values = [row[h] for h in headers]
-			ws.append(values)
-
-			current_row = ws.max_row
-
-			# make proxy column clickable
-			proxy_col = headers.index("proxy") + 1
-			cell = ws.cell(row=current_row, column=proxy_col)
-			cell.hyperlink = row["proxy"]
-			cell.value = row["proxy"]
-			cell.font = Font(color="0000FF", underline="single")
-
-		wb.save(xlsx_path)
-
-		print(f"\nFrequency stats written → {xlsx_path}")
+		out = self.storage_dir / "missing.xlsx"
+		headers = [ "Cites" , "Title" , "Year" , "Proxy" , "DOI" , "Link" , "OA Cited-By" , "WID" , "Citing Papers" ]
+		utils.write_xlsx( out , [
+			( "Top 1000 by Cites"   , headers , top_cited  ),
+			( "Top 1000 by Recency" , headers , top_recent ),
+		])
+		print( f"library={len(snap)} resolved={len(zp)} missing={len(rows)} (deduped {skipped}) -> {out}" )
 
 if __name__ == "__main__":
 	x = OpenAlex()
-	# pprint( x.get_doi( "10.3389/fnhum.2015.00423" ) )
-	x.update_cache()
-	# pprint( x.doi( "10.3389/fnhum.2015.00423" ) )
-	# pprint( x.api_get_id( "W72886680" ) )
+	# x.update_cache()
+	x.stats()
