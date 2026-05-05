@@ -6,6 +6,7 @@ from pprint import pprint
 import utils
 from tqdm import tqdm
 import csv
+from rapidfuzz import fuzz
 from collections import Counter
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -148,7 +149,7 @@ class OpenAlex:
 					reference_data = {}
 				utils.write_json( reference_cached_fp , reference_data )
 
-	def stats( self ):
+	def stats( self , keywords=None , fuzz_threshold=80 ):
 		# 1. OpenAlex data we have for library papers
 		zp = {}
 		for fp in tqdm( list( self.storage_dir.glob( "*.json" ) ) , desc="Loading library" ):
@@ -195,18 +196,30 @@ class OpenAlex:
 			cited_by = " | ".join( title_of( zp[ w ] )[ :80 ] for w in sorted( citers[ rw ] ) )
 			rows.append([ n , title_of( m ) or "(no metadata)" , m.get( "publication_year" ) , proxy , clean_doi , link , m.get( "cited_by_count" ) , rw , cited_by ])
 
-		top_cited  = rows[ :1000 ]
-		top_recent = sorted( rows , key=lambda r: r[ 2 ] or 0 , reverse=True )[ :1000 ]
+		# 5. Build sheets
+		headers = [ "Cites" , "Title" , "Year" , "Proxy" , "DOI" , "Link" , "OA Cited-By" , "WID" , "Citing Papers" ]
+		sheets = [
+			( "Top 1000 by Cites"   , headers , rows[ :1000 ] ),
+			( "Top 1000 by Recency" , headers , sorted( rows , key=lambda r: r[ 2 ] or 0 , reverse=True )[ :1000 ] ),
+		]
+
+		if keywords:
+
+			kws = [ k.lower() for k in keywords ]
+			def hit( title ):
+				if not title: return False
+				t = title.lower()
+				return any( fuzz.partial_ratio( k , t ) >= fuzz_threshold for k in kws )
+			matched = [ r for r in tqdm( rows , desc="Keyword filter" ) if hit( r[ 1 ] ) ]
+			matched.sort( key=lambda r: r[ 2 ] or 0 , reverse=True )
+			sheets.append( ( f"Keyword Matches" , headers , matched[ :1000 ] ) )
+			print( f"keyword hits: {len(matched)} (threshold={fuzz_threshold}, kws={kws})" )
 
 		out = self.storage_dir / "missing.xlsx"
-		headers = [ "Cites" , "Title" , "Year" , "Proxy" , "DOI" , "Link" , "OA Cited-By" , "WID" , "Citing Papers" ]
-		utils.write_xlsx( out , [
-			( "Top 1000 by Cites"   , headers , top_cited  ),
-			( "Top 1000 by Recency" , headers , top_recent ),
-		])
+		utils.write_xlsx( out , sheets )
 		print( f"library={len(snap)} resolved={len(zp)} missing={len(rows)} (deduped {skipped}) -> {out}" )
 
 if __name__ == "__main__":
 	x = OpenAlex()
 	# x.update_cache()
-	x.stats()
+	x.stats( keywords=["speech" , "imagined"] )
