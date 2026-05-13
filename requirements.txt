@@ -1,7 +1,10 @@
+--only-binary=pyyaml
+
 tqdm
 requests
 PyMuPDF
 deskew
+pyyaml==6.0.2
 doclayout_yolo
 docling
 fitz
