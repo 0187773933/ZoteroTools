@@ -5,17 +5,17 @@ import requests
 from pprint import pprint
 import utils
 from tqdm import tqdm
-import csv
 from rapidfuzz import fuzz
 from collections import Counter
-from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl import load_workbook
 
 API_KEY = "bdDEtP2Jp4MhNyiG42Ckzv"
 BASE_URL = "https://api.openalex.org/works/"
 HEADERS = { "User-Agent": "zotero-citation-analyzer/1.0" }
 STORAGE_DIR = Path.home().joinpath( ".zotero-cg" , "openalex" )
 MAX_RETRIES = 10
+
+# ---------- search helpers ----------
 
 def reconstruct_abstract( inv_index ):
 	if not inv_index: return ""
@@ -31,7 +31,6 @@ def make_haystack( meta ):
 def fuzzy_has( haystack , term , threshold=80 ):
 	return fuzz.partial_ratio( term.lower() , haystack ) >= threshold
 
-# Composable predicate builders. Each returns a function(haystack) -> bool.
 def any_of( *terms , threshold=80 ):
 	return lambda h: any( fuzzy_has( h , t , threshold ) for t in terms )
 
@@ -47,6 +46,39 @@ def combine_and( *predicates ):
 def combine_or( *predicates ):
 	return lambda h: any( p( h ) for p in predicates )
 
+# ---------- row helpers ----------
+
+def title_of( d ):
+	return d.get( "title" ) or d.get( "display_name" ) or ""
+
+def build_row( wid , meta , cite_count ):
+	rd = meta.get( "doi" )
+	clean_doi = utils.normalize_doi( rd ) if rd else None
+	proxy_url = f"https://doi-org.ezproxy.libraries.wright.edu/{clean_doi}" if clean_doi else None
+	doi_url   = f"https://doi.org/{clean_doi}" if clean_doi else None
+	proxy = utils.Link( proxy_url , proxy_url ) if proxy_url else ""
+	link  = utils.Link( doi_url , doi_url ) if doi_url else ""
+	return [
+		cite_count,
+		title_of( meta ) or "(no metadata)",
+		meta.get( "publication_year" ),
+		proxy,
+		clean_doi,
+		link,
+		meta.get( "cited_by_count" ),
+		wid,
+	]
+
+HEADERS_ROW = [ "Cites" , "Title" , "Year" , "Proxy" , "DOI" , "Link" , "OA Cited-By" , "WID" ]
+
+def safe_sheet_name( name ):
+	safe = name
+	for ch in ":/\\?*[]":
+		safe = safe.replace( ch , " " )
+	return safe.strip()[ :31 ]
+
+# ---------- main class ----------
+
 class OpenAlex:
 	def __init__( self , options={} ):
 		self.options = options
@@ -60,6 +92,12 @@ class OpenAlex:
 		self.references_dir.mkdir( parents=True , exist_ok=True )
 		self.problem_dois = set()
 
+		# Populated by stats(); reused by add_search_sheets()
+		self._index = []   # list of ( wid , meta , haystack , cite_count , included_in_missing )
+		self._xlsx_path = self.storage_dir / "missing.xlsx"
+
+	# ---------- api ----------
+
 	def get_zotero_id( self , zotero_item ):
 		_save_path = self.storage_dir.joinpath( f"{zotero_item['key']}.json" )
 		return zotero_item.get( "key" )
@@ -69,8 +107,7 @@ class OpenAlex:
 		while True:
 			r = requests.get( url , params=self.params , headers=self.headers )
 			if r.status_code == 200:
-				data = r.json()
-				return data
+				return r.json()
 			elif r.status_code == 429:
 				retry = int( r.headers.get( "Retry-After" , 5 ) )
 				print( f"\nRate limited. Sleeping {retry}s" )
@@ -102,27 +139,24 @@ class OpenAlex:
 		url = BASE_URL + open_alex_wid
 		for attempt in range( MAX_RETRIES ):
 			try:
-				r = requests.get(
-					url,
-					params=self.params,
-					headers=self.headers,
-					timeout=30
-				)
+				r = requests.get( url , params=self.params , headers=self.headers , timeout=30 )
 				if r.status_code == 200:
 					return r.json()
 				elif r.status_code == 429:
-					retry = int(r.headers.get("Retry-After", 5))
-					print(f"\nRate limited resolving refs. Sleeping {retry}s")
-					time.sleep(retry)
+					retry = int( r.headers.get( "Retry-After" , 5 ) )
+					print( f"\nRate limited resolving refs. Sleeping {retry}s" )
+					time.sleep( retry )
 					continue
 				else:
 					return None
 			except requests.exceptions.RequestException as e:
-				wait = min(2 ** attempt, 60)
-				print(f"\nNetwork error ({e}). Retry {attempt+1}/{MAX_RETRIES}. Sleeping {wait}s")
-				time.sleep(wait)
-		print(f"\nFailed after {MAX_RETRIES} retries: {wid}")
+				wait = min( 2 ** attempt , 60 )
+				print( f"\nNetwork error ({e}). Retry {attempt+1}/{MAX_RETRIES}. Sleeping {wait}s" )
+				time.sleep( wait )
+		print( f"\nFailed after {MAX_RETRIES} retries: {open_alex_wid}" )
 		return None
+
+	# ---------- cache ----------
 
 	def update_cache( self ):
 		self.zotero_snapshot = utils.zotero_simple_snapshot()
@@ -137,15 +171,11 @@ class OpenAlex:
 			zotero_cached_fp = self.storage_dir.joinpath( f"{z_id}.json" )
 			if not paper_doi:
 				if zotero_cached_fp.exists():
-					# info = utils.read_json( zotero_cached_fp )
-					# paper_doi = info.get( "doi" )
-					# paper_title = info.get( "title" )
 					continue
 				else:
 					print( "searching title" , paper_title_normalized )
 					search_results = self.api_search_title( paper_title_normalized )
 					if len( search_results ) > 1:
-						# Todo , fix to find one that has a doi ?? or idk
 						paper_dois = [ p.get( "doi" ) for p in search_results if p.get( "doi" ) is not None ]
 						if len( paper_dois ) > 1:
 							paper_doi = paper_dois[ 0 ]
@@ -153,18 +183,15 @@ class OpenAlex:
 							print( "still nothing" , self.zotero_snapshot[ key ] , search_results )
 					utils.write_json( zotero_cached_fp , { "id": z_id , "doi": paper_doi , "title": paper_title } )
 			if not paper_doi:
-				# print( "still nothing" , self.zotero_snapshot[ key ] )
 				continue
 			paper_doi_normalized = utils.normalize_doi( paper_doi )
 			paper_doi_b64 = utils.base64_encode( paper_doi_normalized )
 			paper_cached_fp = self.storage_dir.joinpath( f"{paper_doi_b64}.json" )
-			if paper_cached_fp.exists() == True:
+			if paper_cached_fp.exists():
 				continue
 			paper_data = self.api_get_doi( paper_doi )
 			utils.write_json( paper_cached_fp , paper_data )
 
-			# For Each one that resolves to a doi
-			# Todo , there is still potentially references in the books , etc
 			# 2.) Download all of its References
 			referenced_works = paper_data.get( "referenced_works" )
 			if not referenced_works:
@@ -172,12 +199,14 @@ class OpenAlex:
 			for i , item in enumerate( tqdm( referenced_works , desc="References" , position=1 , leave=False ) ):
 				wid = item.split( "/" )[ -1 ]
 				reference_cached_fp = self.references_dir.joinpath( f"{wid}.json" )
-				if reference_cached_fp.exists() == True:
+				if reference_cached_fp.exists():
 					continue
 				reference_data = self.api_get_id( wid )
 				if not reference_data:
 					reference_data = {}
 				utils.write_json( reference_cached_fp , reference_data )
+
+	# ---------- stats: single disk pass, populates self._index ----------
 
 	def stats( self ):
 		# 1. OpenAlex data we have for library papers
@@ -194,74 +223,88 @@ class OpenAlex:
 		lib_titles = { utils.openalex_normalize_title( i[ "title" ] ) for i in snap.values() if i.get( "title" ) }
 		lib_wids = set( zp.keys() )
 
-		# 3. Tally refs (skip wid hits early)
-		counts , citers = Counter() , {}
+		# 3. Tally refs (skip library wids early)
+		counts = Counter()
 		for wid , p in tqdm( zp.items() , desc="Tallying refs" ):
 			for r in p.get( "referenced_works" ) or []:
 				rw = r.rsplit( "/" , 1 )[ -1 ]
 				if rw in lib_wids:
 					continue
 				counts[ rw ] += 1
-				citers.setdefault( rw , set() ).add( wid )
 
-		# 4. Build rows, second-pass dedup via DOI/title
-		title_of = lambda d: d.get( "title" ) or d.get( "display_name" ) or ""
+		# 4. Single pass: load each ref once, build row, stash haystack
+		#    self._index keeps everything for downstream search sheets
+		self._index = []
 		rows , skipped = [] , 0
 		for rw , n in tqdm( counts.most_common() , desc="Building rows" ):
 			fp = self.references_dir / f"{rw}.json"
-			m = ( utils.read_json( fp ) or {} ) if fp.exists() else {}
-			rd = m.get( "doi" )
-			rt = m.get( "title" ) or m.get( "display_name" )
-			if rd and utils.normalize_doi( rd ) in lib_dois:
-				skipped += 1
-				continue
-			if rt and utils.openalex_normalize_title( rt ) in lib_titles:
-				skipped += 1
-				continue
-			clean_doi = utils.normalize_doi( rd ) if rd else None
-			proxy_url = f"https://doi-org.ezproxy.libraries.wright.edu/{clean_doi}" if clean_doi else None
-			doi_url   = f"https://doi.org/{clean_doi}" if clean_doi else None
-			proxy = utils.Link( proxy_url , proxy_url ) if proxy_url else ""
-			link  = utils.Link( doi_url , doi_url ) if doi_url else ""
-			# cited_by = " | ".join( title_of( zp[ w ] )[ :80 ] for w in sorted( citers[ rw ] ) )
-			rows.append([ n , title_of( m ) or "(no metadata)" , m.get( "publication_year" ) , proxy , clean_doi , link , m.get( "cited_by_count" ) , rw ])
+			meta = ( utils.read_json( fp ) or {} ) if fp.exists() else {}
+			haystack = make_haystack( meta )
 
-		# 5. Build sheets
-		headers = [ "Cites" , "Title" , "Year" , "Proxy" , "DOI" , "Link" , "OA Cited-By" , "WID" ]
+			rt = meta.get( "title" ) or meta.get( "display_name" )
+			rt_norm = utils.openalex_normalize_title( rt ) if rt else None
+			is_dup = bool( rt_norm and rt_norm in lib_titles )
+			self._index.append( ( rw , meta , haystack , n , not is_dup ) )
+
+			if is_dup:
+				skipped += 1
+				continue
+			rows.append( build_row( rw , meta , n ) )
+
+		# 5. Build base sheets
 		sheets = [
-			( "Top 1000 by Cites"   , headers , rows[ :1000 ] ),
-			( "Top 1000 by Recency" , headers , sorted( rows , key=lambda r: r[ 2 ] or 0 , reverse=True )[ :1000 ] ),
+			( "Top 1000 by Cites"   , HEADERS_ROW , rows[ :1000 ] ),
+			( "Top 1000 by Recency" , HEADERS_ROW , sorted( rows , key=lambda r: r[ 2 ] or 0 , reverse=True )[ :1000 ] ),
 		]
 
-		# if keywords:
+		utils.write_xlsx( self._xlsx_path , sheets )
+		print( f"library={len(snap)} resolved={len(zp)} missing={len(rows)} (deduped {skipped}) -> {self._xlsx_path}" )
 
-		# 	kws = [ k.lower() for k in keywords ]
-		# 	def hit( title ):
-		# 		if not title: return False
-		# 		t = title.lower()
-		# 		return any( fuzz.partial_ratio( k , t ) >= fuzz_threshold for k in kws )
-		# 	matched = [ r for r in tqdm( rows , desc="Keyword filter" ) if hit( r[ 1 ] ) ]
-		# 	matched.sort( key=lambda r: r[ 2 ] or 0 , reverse=True )
-		# 	sheets.append( ( f"Keyword Matches" , headers , matched[ :1000 ] ) )
-		# 	print( f"keyword hits: {len(matched)} (threshold={fuzz_threshold}, kws={kws})" )
+	# ---------- search sheets: pure in-memory, no disk re-read ----------
 
-		# if and_keywords:
-		# 	def hit_and( title , terms ):
-		# 		if not title: return False
-		# 		t = title.lower()
-		# 		return all( fuzz.partial_ratio( k.lower() , t ) >= fuzz_threshold for k in terms )
-		# 	for group in and_keywords:
-		# 		matched = [ r for r in tqdm( rows , desc=f"AND filter {group}" ) if hit_and( r[ 1 ] , group ) ]
-		# 		matched.sort( key=lambda r: r[ 2 ] or 0 , reverse=True )
-		# 		sheet_name = "AND " + " + ".join( group )
-		# 		sheets.append( ( sheet_name[ :31 ] , headers , matched[ :1000 ] ) )
-		# 		print( f"AND hits {group}: {len(matched)} (threshold={fuzz_threshold})" )
+	def add_search_sheets( self , searches ):
+		"""Append search-result sheets to missing.xlsx. Requires stats() to have run."""
+		if not self._index:
+			raise RuntimeError( "call stats() first — it builds the search index" )
 
-		out = self.storage_dir / "missing.xlsx"
-		utils.write_xlsx( out , sheets )
-		print( f"library={len(snap)} resolved={len(zp)} missing={len(rows)} (deduped {skipped}) -> {out}" )
+		wb = load_workbook( self._xlsx_path )
+
+		for name , predicate in searches:
+			matched = []
+			for wid , meta , hay , cite_count , included in tqdm( self._index , desc=f"Search: {name}" ):
+				if not included:
+					continue
+				if not predicate( hay ):
+					continue
+				matched.append( build_row( wid , meta , cite_count ) )
+			matched.sort( key=lambda r: r[ 2 ] or 0 , reverse=True )
+
+			safe = safe_sheet_name( name )
+			if safe in wb.sheetnames:
+				del wb[ safe ]
+			ws = wb.create_sheet( safe )
+			ws.append( HEADERS_ROW )
+			for r_idx , row in enumerate( matched[ :1000 ] , start=2 ):
+				for c_idx , val in enumerate( row , start=1 ):
+					cell = ws.cell( row=r_idx , column=c_idx )
+					if isinstance( val , utils.Link ):
+						cell.value = val.text
+						cell.hyperlink = val.url
+						cell.style = "Hyperlink"
+					else:
+						cell.value = val
+			print( f"'{name}': {len(matched)} hits" )
+
+		wb.save( self._xlsx_path )
+		print( f"appended {len(searches)} search sheets -> {self._xlsx_path}" )
+
 
 if __name__ == "__main__":
 	x = OpenAlex()
 	# x.update_cache()
-	x.stats( keywords=[ "inner speech" , "imagined speech"  , "covert speech" ] , and_keywords=[ [ "fMRI" , "speech" ] ] )
+	x.stats()
+	x.add_search_sheets([
+		( "Inner speech (any)" , any_of( "inner speech" , "imagined speech" , "covert speech" , "silent speech" , "subvocalized speech" , "inner monologue" , "imagined phonemes" , "silent communication" , "covert articulation" ) ),
+		( "fMRI + inner speech" , combine_and( all_of( "fMRI" , "speech" ) , any_of( "inner" , "imagined" , "covert" ) ) ) ,
+		# ( "MEG/EEG + imagined" , combine_and( any_of( "MEG" , "EEG" ) , any_of( "imagined" , "covert" ) ) ),
+	])
