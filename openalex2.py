@@ -301,7 +301,7 @@ class OpenAlex:
 
 if __name__ == "__main__":
 	x = OpenAlex()
-	# x.update_cache()
+	x.update_cache()
 	x.stats()
 	x.add_search_sheets([
 		( "Inner speech (any)" , any_of( "inner speech" , "imagined speech" , "covert speech" , "silent speech" , "subvocalized speech" , "inner monologue" , "imagined phonemes" , "silent communication" , "covert articulation" ) ),

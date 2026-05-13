@@ -19,7 +19,7 @@ def write_json( file_path , python_object ):
 		json.dump( python_object , f , ensure_ascii=False , indent=4 )
 
 def read_json( file_path ):
-	with open( file_path ) as f:
+	with open( file_path , encoding='utf-8' ) as f:
 		return json.load( f )
 
 def normalize_doi(value: str) -> str:
